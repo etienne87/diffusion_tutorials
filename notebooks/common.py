@@ -8,13 +8,17 @@ Contains:
   default). ``x_prediction=True`` makes the net predict x and return the
   derived velocity (flow matching only).
 - train: generic training loop used by both notebooks.
+- cosine_beta_schedule, extract: DDPM noise schedule helpers.
+- load_or_train: crash-safe checkpoint helper.
 """
 
 import math
+from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+from numpy.lib.stride_tricks import sliding_window_view
 from sklearn.datasets import make_swiss_roll
 from torch import nn
 from tqdm import tqdm
@@ -101,4 +105,58 @@ def train(data, net, train_step, niter, lr, batch_size=1000):
         loss = train_step(x, net, optim)
         losses.append(loss.item())
         pbar.set_description(f"loss = {loss.item():06f}")
+    return losses
+
+
+# ── DDPM schedule helpers ─────────────────────────────────────────────────────
+
+def cosine_beta_schedule(timesteps, s=0.008):
+    """Cosine noise schedule from 'Improved DDPM' (https://arxiv.org/abs/2102.09672)."""
+    steps = timesteps + 1
+    x = torch.linspace(0, timesteps, steps)
+    alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * torch.pi * 0.5) ** 2
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+    return torch.clip(betas, 0.0001, 0.9999)
+
+
+def extract(a, t, x_shape):
+    """Gather schedule values at timestep t and broadcast to x_shape."""
+    out = a.gather(-1, t.cpu())
+    return out.reshape(t.shape[0], *((1,) * (len(x_shape) - 1))).to(t.device)
+
+
+# ── Checkpoint helper ─────────────────────────────────────────────────────────
+
+def load_or_train(model, name, train_step, data, niter, lr, ckpt_dir,
+                  load=True, save=True):
+    """Load model + smoothed losses from a checkpoint, or train and save.
+
+    Args:
+        model: the nn.Module to train or load into.
+        name: checkpoint filename stem (saved as ``ckpt_dir/<name>.pt``).
+        train_step: callable ``(x, net, optimizer) -> loss``.
+        data: full training tensor (moved to device inside ``train``).
+        niter: number of training iterations.
+        lr: learning rate for AdamW.
+        ckpt_dir: directory for checkpoint files (created if needed).
+        load: if True and checkpoint exists, load instead of training.
+        save: if True after training, persist weights + losses to disk.
+    Returns:
+        losses: smoothed loss array of shape ``(niter,)``.
+    """
+    ckpt_path = Path(ckpt_dir) / f"{name}.pt"
+    if load and ckpt_path.exists():
+        payload = torch.load(ckpt_path, map_location="cpu")
+        model.load_state_dict(payload["state_dict"])
+        losses = np.asarray(payload["losses"])
+        print(f"Loaded {name} from {ckpt_path}")
+        return losses
+    model.train()
+    losses = train(data, model, train_step, niter, lr)
+    losses = sliding_window_view(np.pad(losses, (10, 10), mode='reflect'), 21).mean(axis=1)
+    if save:
+        Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
+        torch.save({"state_dict": model.state_dict(), "losses": losses.tolist()}, ckpt_path)
+        print(f"Saved {name} to {ckpt_path}")
     return losses
