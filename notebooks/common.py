@@ -128,8 +128,8 @@ def extract(a, t, x_shape):
 
 # ── Checkpoint helper ─────────────────────────────────────────────────────────
 
-def load_or_train(model, name, train_step, data, niter, lr, ckpt_dir,
-                  load=True, save=True):
+def load_or_train(model, name, train_step, data, niter, lr, ckpt_dir, 
+                  batch_size=1000, load=True, save=True):
     """Load model + smoothed losses from a checkpoint, or train and save.
 
     Args:
@@ -140,6 +140,7 @@ def load_or_train(model, name, train_step, data, niter, lr, ckpt_dir,
         niter: number of training iterations.
         lr: learning rate for AdamW.
         ckpt_dir: directory for checkpoint files (created if needed).
+        batch_size: training batch size.
         load: if True and checkpoint exists, load instead of training.
         save: if True after training, persist weights + losses to disk.
     Returns:
@@ -153,7 +154,7 @@ def load_or_train(model, name, train_step, data, niter, lr, ckpt_dir,
         print(f"Loaded {name} from {ckpt_path}")
         return losses
     model.train()
-    losses = train(data, model, train_step, niter, lr)
+    losses = train(data, model, train_step, niter, lr, batch_size)
     losses = sliding_window_view(np.pad(losses, (10, 10), mode='reflect'), 21).mean(axis=1)
     if save:
         Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
