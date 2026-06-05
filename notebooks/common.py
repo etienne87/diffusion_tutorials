@@ -7,6 +7,8 @@ Contains:
   (flow-matching default); ``time_dim>0`` uses a sinusoidal embedding (DDPM
   default). ``x_prediction=True`` makes the net predict x and return the
   derived velocity (flow matching only).
+- CondMLP: time- and label-conditioned MLP for conditional flow matching.
+  Supports pred_type="v" (velocity) and pred_type="x" (clean data / x-pred).
 - train: generic training loop used by both notebooks.
 - cosine_beta_schedule, extract: DDPM noise schedule helpers.
 - load_or_train: crash-safe checkpoint helper.
@@ -90,6 +92,51 @@ class TinyMLP(nn.Module):
         if self.x_prediction:
             return (z - y) / t
         return y
+
+
+class CondMLP(nn.Module):
+    """Time- and label-conditioned MLP for conditional flow matching.
+
+    pred_type="v"  (velocity prediction, default in standard CFM):
+        Network predicts the velocity  v = e − x.
+        Training loss: ||v̂ − (e − x)||²
+
+    pred_type="x"  (data / x-prediction):
+        Network predicts the clean data x directly.
+        Training loss: ||x̂ − x||²
+        Implicitly down-weights large-noise timesteps (t → 1), which can
+        help the model focus on the signal-rich region near t = 0 and
+        produce sharper samples on complex distributions.
+
+    ``forward()`` always returns the *raw* network output (v̂ or x̂).
+    Use ``loss_target(x, e)`` for the training objective and
+    ``to_velocity(raw, z, t)`` to convert the output to velocity for
+    the Euler sampler — so sample_cfg works identically for both modes.
+
+    Label index ``n_classes`` is the null token ∅ used for CFG dropout
+    and unlabeled training points.
+    """
+
+    def __init__(self, num_in, hidden, n_classes, time_dim=32, cond_dim=32,
+                 n_residual=4,  x_prediction=False):
+        super().__init__()
+        self.x_prediction   = x_prediction
+        self.n_classes   = n_classes
+        self.null_idx    = n_classes
+        self.time_embed  = SinusoidalTimeEmbedding(time_dim)
+        self.label_embed = nn.Embedding(n_classes + 1, cond_dim)
+        in_features = num_in + time_dim + cond_dim
+        layers  = [nn.Linear(in_features, hidden), nn.GELU()]
+        layers += [Residual(hidden) for _ in range(n_residual)]
+        layers += [nn.GELU(), nn.Linear(hidden, num_in)]
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, z, t, y):
+        """Raw network output: v̂ (pred_type='v') or x̂ (pred_type='x')."""
+        o = self.mlp(torch.cat([z, self.time_embed(t), self.label_embed(y)], dim=1))
+        if self.x_prediction:
+            return (z - o) / t
+        return o    
 
 
 def train(data, net, train_step, niter, lr, batch_size=1000):
