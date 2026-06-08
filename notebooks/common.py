@@ -7,11 +7,14 @@ Contains:
   (flow-matching default); ``time_dim>0`` uses a sinusoidal embedding (DDPM
   default). ``x_prediction=True`` makes the net predict x and return the
   derived velocity (flow matching only).
+- MeanFlowMLP: two-time backbone for Mean Flow experiments.
 - CondMLP: time- and label-conditioned MLP for conditional flow matching.
   Supports pred_type="v" (velocity) and pred_type="x" (clean data / x-pred).
 - train: generic training loop used by both notebooks.
 - cosine_beta_schedule, extract: DDPM noise schedule helpers.
 - load_or_train: crash-safe checkpoint helper.
+- generate_samples_euler, generate_samples_ode, generate_samples_ddpm,
+  generate_samples_mean_flow: shared toy-model samplers.
 """
 
 import math
@@ -94,6 +97,36 @@ class TinyMLP(nn.Module):
         return y
 
 
+class MeanFlowMLP(nn.Module):
+    """TinyMLP-style network conditioned on two times (t, r).
+
+    time_dim=0 -> concat raw (t, r); >0 -> sinusoidal embedding of each.
+    """
+
+    def __init__(self, num_in, hidden, time_dim=0, n_residual=7):
+        super().__init__()
+        self.time_dim = time_dim
+        if time_dim > 0:
+            self.time_embed = SinusoidalTimeEmbedding(time_dim)
+            in_features = num_in + 2 * time_dim
+        else:
+            self.time_embed = None
+            in_features = num_in + 2
+
+        layers = [nn.Linear(in_features, hidden), nn.GELU()]
+        layers += [Residual(hidden) for _ in range(n_residual)]
+        layers += [nn.GELU(), nn.Linear(hidden, num_in)]
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, z, t, r):
+        if self.time_embed is not None:
+            t_feat = self.time_embed(t)
+            r_feat = self.time_embed(r)
+        else:
+            t_feat, r_feat = t, r
+        return self.mlp(torch.cat([z, t_feat, r_feat], dim=1))
+
+
 class CondMLP(nn.Module):
     """Time- and label-conditioned MLP for conditional flow matching.
 
@@ -139,19 +172,96 @@ class CondMLP(nn.Module):
         return o    
 
 
-def train(data, net, train_step, niter, lr, batch_size=1000):
-    """Generic training loop. ``train_step(x, net, optimizer) -> loss``."""
+class MeanFlowMLP(nn.Module):
+    """TinyMLP-style network conditioned on two times (t, r).
+
+    time_dim=0 -> concat raw (t, r); >0 -> sinusoidal embedding of each.
+    """
+
+    def __init__(self, num_in, hidden, time_dim=0, n_residual=7):
+        super().__init__()
+        self.time_dim = time_dim
+        if time_dim > 0:
+            self.time_embed = SinusoidalTimeEmbedding(time_dim)
+            in_features = num_in + 2 * time_dim
+        else:
+            self.time_embed = None
+            in_features = num_in + 2
+
+        layers = [nn.Linear(in_features, hidden), nn.GELU()]
+        layers += [Residual(hidden) for _ in range(n_residual)]
+        layers += [nn.GELU(), nn.Linear(hidden, num_in)]
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, z, t, r):
+        if self.time_embed is not None:
+            t_feat = self.time_embed(t)
+            r_feat = self.time_embed(r)
+        else:
+            t_feat, r_feat = t, r
+        return self.mlp(torch.cat([z, t_feat, r_feat], dim=1))
+
+
+def _coerce_train_step_output(out):
+    """Normalize train_step output to ``(loss, stats_dict_or_none)``.
+
+    Supported train_step returns:
+    - loss tensor/scalar
+    - (loss, stats_dict)
+    """
+    if isinstance(out, tuple):
+        if len(out) != 2:
+            raise ValueError("train_step tuple output must be (loss, stats_dict)")
+        loss, stats = out
+        if stats is not None and not isinstance(stats, dict):
+            raise TypeError("train_step stats must be a dict or None")
+        return loss, stats
+    return out, None
+
+
+def _to_serializable(value):
+    """Convert tensors/arrays/scalars in stats dict to plain Python types."""
+    if torch.is_tensor(value):
+        if value.numel() == 1:
+            return value.detach().item()
+        return value.detach().cpu().reshape(-1).tolist()
+    if isinstance(value, np.ndarray):
+        if value.size == 1:
+            return value.item()
+        return value.reshape(-1).tolist()
+    if isinstance(value, (np.floating, np.integer)):
+        return value.item()
+    if isinstance(value, (float, int, bool, str)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return str(value)
+
+
+def train(data, net, train_step, niter, lr, batch_size=1000, return_stats=False):
+    """Generic training loop.
+
+    ``train_step(x, net, optimizer)`` may return:
+    - loss
+    - (loss, stats_dict)
+    """
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     net.to(device)
     data = data.to(device)
     optim = torch.optim.AdamW(net.parameters(), lr=lr)
     losses = []
+    stats_hist = [] if return_stats else None
     for _ in (pbar := tqdm(range(niter), ncols=100)):
         idx = torch.randperm(len(data))[:batch_size]
         x = data[idx].contiguous()
-        loss = train_step(x, net, optim)
+        step_out = train_step(x, net, optim)
+        loss, stats = _coerce_train_step_output(step_out)
         losses.append(loss.item())
+        if return_stats:
+            stats_hist.append({k: _to_serializable(v) for k, v in (stats or {}).items()})
         pbar.set_description(f"loss = {loss.item():06f}")
+    if return_stats:
+        return losses, stats_hist
     return losses
 
 
@@ -175,8 +285,8 @@ def extract(a, t, x_shape):
 
 # ── Checkpoint helper ─────────────────────────────────────────────────────────
 
-def load_or_train(model, name, train_step, data, niter, lr, ckpt_dir, 
-                  batch_size=1000, load=True, save=True):
+def load_or_train(model, name, train_step, data, niter, lr, ckpt_dir,
+                  batch_size=1000, load=True, save=True, return_stats=False):
     """Load model + smoothed losses from a checkpoint, or train and save.
 
     Args:
@@ -190,8 +300,11 @@ def load_or_train(model, name, train_step, data, niter, lr, ckpt_dir,
         batch_size: training batch size.
         load: if True and checkpoint exists, load instead of training.
         save: if True after training, persist weights + losses to disk.
+        return_stats: if True, also return per-iteration stats dictionaries
+            emitted by ``train_step``.
     Returns:
         losses: smoothed loss array of shape ``(niter,)``.
+        stats (optional): list[dict], one entry per training iteration.
     """
     ckpt_path = Path(ckpt_dir) / f"{name}.pt"
     if load and ckpt_path.exists():
@@ -199,12 +312,127 @@ def load_or_train(model, name, train_step, data, niter, lr, ckpt_dir,
         model.load_state_dict(payload["state_dict"])
         losses = np.asarray(payload["losses"])
         print(f"Loaded {name} from {ckpt_path}")
+        if return_stats:
+            return losses, payload.get("stats", [])
         return losses
     model.train()
-    losses = train(data, model, train_step, niter, lr, batch_size)
+    train_out = train(data, model, train_step, niter, lr, batch_size, return_stats=return_stats)
+    if return_stats:
+        losses, stats = train_out
+    else:
+        losses = train_out
     losses = sliding_window_view(np.pad(losses, (10, 10), mode='reflect'), 21).mean(axis=1)
     if save:
         Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
-        torch.save({"state_dict": model.state_dict(), "losses": losses.tolist()}, ckpt_path)
+        payload = {"state_dict": model.state_dict(), "losses": losses.tolist()}
+        if return_stats:
+            payload["stats"] = stats
+        torch.save(payload, ckpt_path)
         print(f"Saved {name} to {ckpt_path}")
+    if return_stats:
+        return losses, stats
     return losses
+
+# ── Sample Generators ─────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def generate_samples_euler(model, n_samples=1000, n_steps=1000, return_trajectories=False):
+    """Euler sampler for time-conditioned flow models."""
+    device = next(model.parameters()).device
+    z = torch.randn(n_samples, 2, device=device)
+    dt = 1.0 / n_steps
+    trajectories = []
+    model.eval()
+    with torch.no_grad():
+        for i in range(n_steps):
+            t = torch.full((n_samples, 1), 1 - i * dt, device=device)
+            v = model(z, t)
+            z = z - v * dt
+            if return_trajectories:
+                trajectories.append(z.cpu().numpy())
+    if return_trajectories:
+        return trajectories
+    return z.cpu()
+
+
+@torch.no_grad()
+def generate_samples_ode(model, n_samples=1000, method='RK45', rtol=1e-2, atol=1e-3,
+                         return_trajectories=False, n_eval=100):
+    """ODE sampler for time-conditioned flow models."""
+    from scipy.integrate import solve_ivp
+
+    device = next(model.parameters()).device
+    z0 = torch.randn(n_samples, 2, device=device)
+    model.eval()
+
+    t_span = [1.0, 0.00001]
+    t_eval = np.linspace(t_span[0], t_span[1], n_eval) if return_trajectories else None
+
+    with torch.no_grad():
+        def ode_func(t, z_flat):
+            z = torch.from_numpy(z_flat.reshape(n_samples, 2)).float().to(device)
+            t_tensor = torch.full((n_samples, 1), t, device=device)
+            v = model(z, t_tensor)
+            return v.cpu().numpy().flatten()
+
+        solution = solve_ivp(
+            ode_func,
+            t_span=t_span,
+            y0=z0.cpu().numpy().flatten(),
+            method=method,
+            rtol=rtol,
+            atol=atol,
+            t_eval=t_eval,
+        )
+
+    if return_trajectories:
+        traj = solution.y.T.reshape(n_eval, n_samples, 2)
+        return [traj[i] for i in range(n_eval)]
+
+    z_final = solution.y[:, -1].reshape(n_samples, 2)
+    return torch.from_numpy(z_final)
+
+
+@torch.no_grad()
+def generate_samples_ddpm(model, betas, alphas_cumprod, n_samples=1000,
+                          n_steps=100, return_trajectories=False, x0_clip=3.0):
+    """Deterministic DDIM sampler for DDPM-style models."""
+    T = len(betas)
+    ts = np.round(np.linspace(T - 1, 0, n_steps)).astype(int)
+    device = next(model.parameters()).device
+
+    x = torch.randn(n_samples, 2, device=device)
+    trajectories = []
+    model.eval()
+    with torch.no_grad():
+        for i, t_idx in enumerate(ts):
+            ac_t = alphas_cumprod[t_idx].to(device)
+            ac_prev = (alphas_cumprod[ts[i + 1]] if i + 1 < len(ts) else torch.tensor(1.0)).to(device)
+            t_float = torch.full((n_samples, 1), float(t_idx) / T, device=device)
+            eps_pred = model(x, t_float)
+            x0_pred = ((x - (1 - ac_t).sqrt() * eps_pred) / ac_t.sqrt()).clamp(-x0_clip, x0_clip)
+            x = ac_prev.sqrt() * x0_pred + (1 - ac_prev).sqrt() * eps_pred
+            if return_trajectories:
+                trajectories.append(x.cpu().numpy())
+    if return_trajectories:
+        return trajectories
+    return x.cpu()
+
+
+@torch.no_grad()
+def generate_samples_mean_flow(model, n_samples=1000, n_steps=1, return_trajectories=False):
+    """K-step sampler for Mean Flow models with inputs (z, t, r)."""
+    device = next(model.parameters()).device
+    z = torch.randn(n_samples, 2, device=device)
+    t_vals = torch.linspace(1.0, 0.0, n_steps + 1, device=device)
+    trajectories = [z.cpu().numpy()] if return_trajectories else None
+    for i in range(n_steps):
+        t = torch.full((n_samples, 1), float(t_vals[i]), device=device)
+        r = torch.full((n_samples, 1), float(t_vals[i + 1]), device=device)
+        u = model(z, t, r)
+        z = z - (t - r) * u
+        if return_trajectories:
+            trajectories.append(z.cpu().numpy())
+    if return_trajectories:
+        return trajectories
+    return z.cpu()
