@@ -340,7 +340,7 @@ def load_or_train(model, name, train_step, data, niter, lr, ckpt_dir,
 # ── Sample Generators ─────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def generate_samples_euler(model, n_samples=1000, n_steps=1000, return_trajectories=False, reverse_time=False):
+def generate_samples_euler(model, n_samples=1000, n_steps=1000, return_trajectories=False):
     """Euler sampler for time-conditioned flow models."""
     device = next(model.parameters()).device
     z = torch.randn(n_samples, 2, device=device)
@@ -350,10 +350,10 @@ def generate_samples_euler(model, n_samples=1000, n_steps=1000, return_trajector
     model.eval()
     with torch.no_grad():
         for i in range(n_steps):
-            val = i * dt if reverse_time else 1 - i * dt
+            val = i * dt if model.reverse_time else 1 - i * dt
             t = torch.full((n_samples, 1), val, device=device)
             v = model(z, t)
-            if reverse_time:
+            if model.reverse_time:
                 z = z + v * dt
             else:
                 z = z - v * dt
@@ -366,15 +366,16 @@ def generate_samples_euler(model, n_samples=1000, n_steps=1000, return_trajector
 
 @torch.no_grad()
 def generate_samples_ode(model, n_samples=1000, method='RK45', rtol=1e-2, atol=1e-3,
-                         return_trajectories=False, n_eval=100, reverse_time=False):
+                         return_trajectories=False, n_eval=100):
     """ODE sampler for time-conditioned flow models."""
     from scipy.integrate import solve_ivp
+    
 
     device = next(model.parameters()).device
     z0 = torch.randn(n_samples, 2, device=device)
     model.eval()
 
-    t_span = [1.0, 0.00001] if not reverse_time else [0.00001, 1.0]
+    t_span = [1.0, 0.00001] if not model.reverse_time else [0.00001, 1.0]
     t_eval = np.linspace(t_span[0], t_span[1], n_eval) if return_trajectories else None
 
     with torch.no_grad():
