@@ -73,7 +73,7 @@ class TinyMLP(nn.Module):
             implied velocity v = (z - x_pred) / t (flow matching only).
         n_residual: number of residual blocks in the trunk.
     """
-    def __init__(self, num_in, hidden, time_dim=0, x_prediction=False, n_residual=4):
+    def __init__(self, num_in, hidden, time_dim=0, x_prediction=False, n_residual=4, reverse_time=False):
         super().__init__()
         self.time_dim = time_dim
         self.x_prediction = x_prediction
@@ -88,12 +88,16 @@ class TinyMLP(nn.Module):
         layers += [Residual(hidden) for _ in range(n_residual)]
         layers += [nn.GELU(), nn.Linear(hidden, num_in)]
         self.mlp = nn.Sequential(*layers)
+        self.reverse_time = reverse_time 
 
     def forward(self, z, t):
         t_feat = self.time_embed(t) if self.time_embed is not None else t
         y = self.mlp(torch.cat((z, t_feat), dim=1))
         if self.x_prediction:
-            return (z - y) / t
+            if self.reverse_time:
+                return (y - z) / (1 - t)
+            else:
+                return (z - y) / t
         return y
 
 
@@ -336,18 +340,23 @@ def load_or_train(model, name, train_step, data, niter, lr, ckpt_dir,
 # ── Sample Generators ─────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def generate_samples_euler(model, n_samples=1000, n_steps=1000, return_trajectories=False):
+def generate_samples_euler(model, n_samples=1000, n_steps=1000, return_trajectories=False, reverse_time=False):
     """Euler sampler for time-conditioned flow models."""
     device = next(model.parameters()).device
     z = torch.randn(n_samples, 2, device=device)
     dt = 1.0 / n_steps
+
     trajectories = []
     model.eval()
     with torch.no_grad():
         for i in range(n_steps):
-            t = torch.full((n_samples, 1), 1 - i * dt, device=device)
+            val = i * dt if reverse_time else 1 - i * dt
+            t = torch.full((n_samples, 1), val, device=device)
             v = model(z, t)
-            z = z - v * dt
+            if reverse_time:
+                z = z + v * dt
+            else:
+                z = z - v * dt
             if return_trajectories:
                 trajectories.append(z.cpu().numpy())
     if return_trajectories:
@@ -357,7 +366,7 @@ def generate_samples_euler(model, n_samples=1000, n_steps=1000, return_trajector
 
 @torch.no_grad()
 def generate_samples_ode(model, n_samples=1000, method='RK45', rtol=1e-2, atol=1e-3,
-                         return_trajectories=False, n_eval=100):
+                         return_trajectories=False, n_eval=100, reverse_time=False):
     """ODE sampler for time-conditioned flow models."""
     from scipy.integrate import solve_ivp
 
@@ -365,7 +374,7 @@ def generate_samples_ode(model, n_samples=1000, method='RK45', rtol=1e-2, atol=1
     z0 = torch.randn(n_samples, 2, device=device)
     model.eval()
 
-    t_span = [1.0, 0.00001]
+    t_span = [1.0, 0.00001] if not reverse_time else [0.00001, 1.0]
     t_eval = np.linspace(t_span[0], t_span[1], n_eval) if return_trajectories else None
 
     with torch.no_grad():
