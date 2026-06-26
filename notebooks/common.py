@@ -288,7 +288,6 @@ def extract(a, t, x_shape):
 
 
 # ── Checkpoint helper ─────────────────────────────────────────────────────────
-
 def load_or_train(model, name, train_step, data, niter, lr, ckpt_dir,
                   batch_size=1000, load=True, save=True, return_stats=False):
     """Load model + smoothed losses from a checkpoint, or train and save.
@@ -340,10 +339,10 @@ def load_or_train(model, name, train_step, data, niter, lr, ckpt_dir,
 # ── Sample Generators ─────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def generate_samples_euler(model, n_samples=1000, n_steps=1000, return_trajectories=False):
+def generate_samples_euler(model, d_dim=2, n_samples=1000, n_steps=1000, return_trajectories=False):
     """Euler sampler for time-conditioned flow models."""
     device = next(model.parameters()).device
-    z = torch.randn(n_samples, 2, device=device)
+    z = torch.randn(n_samples, d_dim, device=device)
     dt = 1.0 / n_steps
 
     trajectories = []
@@ -365,14 +364,14 @@ def generate_samples_euler(model, n_samples=1000, n_steps=1000, return_trajector
 
 
 @torch.no_grad()
-def generate_samples_ode(model, n_samples=1000, method='RK45', rtol=1e-2, atol=1e-3,
-                         return_trajectories=False, n_eval=100):
+def generate_samples_ode(model, d_dim=2, n_samples=1000, method='RK45', rtol=1e-2, atol=1e-3,
+                         return_trajectories=False, n_eval=100, return_noise=False):
     """ODE sampler for time-conditioned flow models."""
     from scipy.integrate import solve_ivp
     
 
     device = next(model.parameters()).device
-    z0 = torch.randn(n_samples, 2, device=device)
+    z0 = torch.randn(n_samples, d_dim, device=device)
     model.eval()
 
     t_span = [1.0, 0.00001] if not model.reverse_time else [0.00001, 1.0]
@@ -380,7 +379,7 @@ def generate_samples_ode(model, n_samples=1000, method='RK45', rtol=1e-2, atol=1
 
     with torch.no_grad():
         def ode_func(t, z_flat):
-            z = torch.from_numpy(z_flat.reshape(n_samples, 2)).float().to(device)
+            z = torch.from_numpy(z_flat.reshape(n_samples, d_dim)).float().to(device)
             t_tensor = torch.full((n_samples, 1), t, device=device)
             v = model(z, t_tensor)
             return v.cpu().numpy().flatten()
@@ -400,18 +399,20 @@ def generate_samples_ode(model, n_samples=1000, method='RK45', rtol=1e-2, atol=1
         return [traj[i] for i in range(n_eval)]
 
     z_final = solution.y[:, -1].reshape(n_samples, 2)
+    if return_noise: 
+        return z0, torch.from_numpy(z_final)
     return torch.from_numpy(z_final)
 
 
 @torch.no_grad()
-def generate_samples_ddpm(model, betas, alphas_cumprod, n_samples=1000,
+def generate_samples_ddpm(model, betas, alphas_cumprod, d_dim=2, n_samples=1000,
                           n_steps=100, return_trajectories=False, x0_clip=3.0):
     """Deterministic DDIM sampler for DDPM-style models."""
     T = len(betas)
     ts = np.round(np.linspace(T - 1, 0, n_steps)).astype(int)
     device = next(model.parameters()).device
 
-    x = torch.randn(n_samples, 2, device=device)
+    x = torch.randn(n_samples, d_dim, device=device)
     trajectories = []
     model.eval()
     with torch.no_grad():
